@@ -1,0 +1,21 @@
+# Referenz-Kopie – im Container wird diese Unit vom Installer geschrieben
+# (TTYD_PASSWORD wird bei der Installation generiert; Quelle: install/sellbird.sh).
+[Unit]
+Description=Sellbird Webterminal (ttyd als sellbird: Claude-Login, setup, train, run)
+Documentation=https://github.com/ethanplusai/sellbird
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sellbird
+Group=sellbird
+WorkingDirectory=/opt/sellbird/app
+Environment=HOME=/home/sellbird
+ExecStart=/usr/local/bin/ttyd --port 8091 --credential sellbird:GENERATED --max-clients 3 -W bash -l
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,24 @@
+# Referenz-Kopie – im Container wird diese Unit vom Installer geschrieben
+# (Pfade/Env entsprechend; Quelle: install/sellbird.sh, Inner-Script).
+[Unit]
+Description=Sellbird Dashboard (outreach platform, loopback :5555)
+Documentation=https://github.com/ethanplusai/sellbird
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sellbird
+Group=sellbird
+WorkingDirectory=/opt/sellbird/app
+Environment=SELLBIRD_HOME=/opt/sellbird/app
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/home/sellbird
+Environment=PATH=/home/sellbird/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/opt/sellbird/venv/bin/sellbird dashboard
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
