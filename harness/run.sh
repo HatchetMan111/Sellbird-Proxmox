@@ -142,6 +142,10 @@ ln -sf "$MK/mock-curl"       "$INNERBIN/curl"
 ln -sf "$MK/mock-runuser"    "$INNERBIN/runuser"
 ln -sf "$MK/mock-nginx"      "$INNERBIN/nginx"
 ln -sf "$MK/mock-dpkg"       "$INNERBIN/dpkg"
+# Host-Seite: dpkg --print-architecture / uname -m laufen im Installer VOR dem
+# pct create (Template-Wahl) → auch in HOSTBIN mocken, sonst echtes Host-Arch.
+ln -sf "$MK/mock-dpkg"       "$HOSTBIN/dpkg"
+ln -sf "$MK/mock-uname"      "$HOSTBIN/uname"
 ln -sf "$MK/mock-timedatectl" "$INNERBIN/timedatectl"
 ln -sf "$MK/mock-hostname"   "$INNERBIN/hostname"
 ln -sf "$MK/mock-sleep"      "$INNERBIN/sleep"
@@ -183,7 +187,22 @@ EOF
 
 cat > "$MK/mock-dpkg" <<'EOF'
 #!/usr/bin/env bash
-echo "amd64"
+# dpkg-Mock: --print-architecture → Host-Arch (Flag host_arch=arm64 für den
+# arm64-Template-auf-amd64-Livefall). Default amd64.
+set -u
+HS="${HARNESS_STATE:?}"
+arch="amd64"
+[[ -f "$HS/host_arch" ]] && arch=$(/bin/sed -n 's/^host_arch=//p' "$HS/host_arch")
+echo "$arch"
+EOF
+cat > "$MK/mock-uname" <<'EOF'
+#!/usr/bin/env bash
+# uname-Mock: -m → Host-Arch (Fallback, falls dpkg --print-architecture fehlt)
+set -u
+HS="${HARNESS_STATE:?}"
+arch="x86_64"
+[[ -f "$HS/host_arch" ]] && a=$(/bin/sed -n 's/^host_arch=//p' "$HS/host_arch") && [[ "$a" == "arm64" ]] && arch="aarch64"
+echo "$arch"
 EOF
 
 cat > "$MK/mock-timedatectl" <<'EOF'
@@ -560,36 +579,53 @@ EOF
 
 cat > "$MK/mock-pveam" <<'EOF'
 #!/usr/bin/env bash
+# pveam-Mock: listet Templates je nach HS-Flag. In 'available' stehen BEIDE
+# Architekturen (amd64+arm64) – wie real auf einem Proxmox-Mirror. Der
+# Installer muss anhand der Host-Arch (mock-dpkg) das passende filtern.
 set -u
 HS="${HARNESS_STATE:?}"
 echo "pveam $*" >> "$HS/calls.log"
-TMPL13="local:vztmpl/debian-13-standard_13.2-1_amd64.tar.zst"
-TMPL12="local:vztmpl/debian-12-standard_12.7-1_amd64.tar.zst"
+T13A="local:vztmpl/debian-13-standard_13.2-1_amd64.tar.zst"
+T13B="local:vztmpl/debian-13-standard_13.2-1_arm64.tar.zst"
+T12A="local:vztmpl/debian-12-standard_12.7-1_amd64.tar.zst"
+T12B="local:vztmpl/debian-12-standard_12.7-1_arm64.tar.zst"
 case "${1:-}" in
     list)
-        if [[ -f "$HS/template_downloaded" && ! -f "$HS/pveam_empty" ]]; then
+        # Simuliert den Live-Fall ProxSmartHome: im lokalen Cache liegt NUR
+        # ein arm64-Template, während der Host amd64 ist.
+        if [[ -f "$HS/cache_only_arm64" ]]; then
+            echo "$T13B  100000000"
+        elif [[ -f "$HS/template_downloaded" && ! -f "$HS/pveam_empty" ]]; then
             if [[ -f "$HS/only_debian12" ]]; then
-                echo "$TMPL12  90000000"
+                echo "$T12A  90000000"
             else
-                echo "$TMPL13  100000000"
+                echo "$T13A  100000000"
             fi
         fi
         exit 0 ;;
     available)
         if [[ ! -f "$HS/pveam_empty" ]]; then
             if [[ -f "$HS/only_debian12" ]]; then
-                echo "system          $TMPL12  90000000"
+                echo "system          $T12A  90000000"
+                echo "system          $T12B  90000000"
+            elif [[ -f "$HS/only_arm64" ]]; then
+                echo "system          $T13B  100000000"
             else
-                echo "system          $TMPL12  90000000"
-                echo "system          $TMPL13  100000000"
+                echo "system          $T12A  90000000"
+                echo "system          $T12B  90000000"
+                echo "system          $T13A  100000000"
+                echo "system          $T13B  100000000"
             fi
         fi
         exit 0 ;;
     update)   exit 0 ;;
     download)
+        # Der Installer ruft 'pveam download local <name>' auf; wir legen
+        # ein Template-File passend zum angeforderten Namen an.
         mkdir -p "$HS/templates"
-        touch "$HS/templates/debian-13-standard_13.2-1_amd64.tar.zst"
-        touch "$HS/templates/debian-12-standard_12.7-1_amd64.tar.zst"
+        name="${*: -1}"
+        base="${name##*/}"
+        touch "$HS/templates/$base"
         touch "$HS/template_downloaded"
         exit 0 ;;
 esac
@@ -871,8 +907,30 @@ assert_fregex "$HS/ct_200.create" '(^| )--memory 2048( |$)'
 assert_fregex "$HS/ct_200.create" '(^| )--cores 2( |$)'
 assert_fregex "$HS/ct_200.create" '(^| )--rootfs local-lvm:8( |$)'
 assert_fregex "$HS/ct_200.create" 'name=eth0,bridge=vmbr0,ip=dhcp,firewall=0'
+# Host ist amd64 (mock-dpkg) → Template MUSS amd64 sein, nie arm64!
+assert_fregex "$HS/ct_200.create" 'debian-13-standard.*amd64'
 
-# ── Case 3: Nächste freie ID ab 200 ────────────────────────────────────────
+# ── Case 2b: Live-Grube arm64-Template im Cache auf amd64-Host ─────────────
+# ProxSmartHome 2026-11-21: im lokalen Cache lag NUR ein arm64-Template,
+# pct create nahm es, pct start starb mit "Exec format error". Der Installer
+# muss das arm64 überspringen und das amd64 nachladen.
+t "Arch-Filter: arm64-Template im Cache auf amd64-Host"
+reset_state
+touch "$HS/cache_only_arm64"
+rc=$(run_installer_devnull)
+assert_exit 0 "$rc"
+assert_fregex "$HS/ct_200.create" 'debian-13-standard.*amd64'
+assert_fnot_contains "$HS/ct_200.create" 'arm64'
+assert_calls 1 "pveam download local debian-13-standard_13.2-1_amd64.tar.zst"
+assert_out "Host-Architektur: amd64"
+
+# ── Case 2c: Nur fremdarchiges Template verfügbar → klare Fehlermeldung ────
+t "Arch-Filter: kein passendes Template → Abbruch mit Hinweis"
+reset_state
+touch "$HS/only_arm64"
+rc=$(run_installer_devnull)
+assert_exit 1 "$rc"
+assert_out "Kein Debian-13/12-Template für Architektur"
 t "Nächste freie CT-ID"
 reset_state
 printf '200 running alpha\n201 running beta\n' > "$HS/ct_list"
@@ -1133,7 +1191,7 @@ assert_file "$(sb "$SB_OPT/sellbird/app/skills/discover.md")"
 echo ""
 echo "════════════════════════════════════════════════════════════"
 if [[ $FAILED -eq 0 ]]; then
-    echo " ✅ ALLE GRÜN: $PASSED Assertions in 30 Cases bestanden"
+    echo " ✅ ALLE GRÜN: $PASSED Assertions in 32 Cases bestanden"
 else
     echo " ❌ FEHLGESCHLAGEN: $FAILED Assertions (von $((PASSED+FAILED))), $PASSED grün"
     echo "    Detail mit: bash harness/run.sh -v   (oder HARNESS_KEEP=1 für Sandbox)"

@@ -37,7 +37,7 @@
 set -Eeuo pipefail
 
 # ── Defaults ────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="1.0.0"   # wird in --status/-Logs ausgegeben – hilft bei Fehlersuche
+INSTALLER_VERSION="1.0.1"   # 1.0.1: arm64-Template-auf-amd64-Fix (arch-gefilterte Template-Wahl)
 APP_NAME="sellbird"
 UPSTREAM_URL="https://github.com/ethanplusai/sellbird.git"
 PINNED_REF="b212385259da92246a56311d790d936e75dd70dd"  # v0.4.0, 2026-11-18 – Upstream-HEAD beim Installer-Bau
@@ -962,22 +962,74 @@ do_install() {
 
     # Debian-Template sicherstellen (13 bevorzugt = Python 3.13; Fallback 12 = 3.11)
     header "🧱 Container-Template"
+    # Grube (arm64-Template-Falle, Live-Fund ProxSmartHome 2026-11-21): im
+    # lokalen Cache kann NUR ein Template einer FREMDEN Architektur liegen
+    # (z. B. debian-…_arm64 auf einem amd64-Host). pct create nimmt es an,
+    # aber pct start stirbt mit "Exec format error – Failed to exec /sbin/init".
+    # Deshalb filtern wir die Kandidaten nach der Host-Architektur und laden
+    # bei Bedarf das passende nach.
+    local host_arch want_suffix
+    host_arch=$(dpkg --print-architecture 2>/dev/null || uname -m)
+    case "$host_arch" in
+        amd64)    want_suffix="amd64" ;;
+        arm64|aarch64) want_suffix="arm64" ;;
+        *)        want_suffix="$host_arch" ;;
+    esac
+    info "Host-Architektur: ${host_arch} → Templates mit '_${want_suffix}'"
+    # Filtert Template-Namen auf die passende Endung; ohne Endung (ono) = passt.
+    # WICHTIG: Template-Namen IMMER auf die reine Namensspalte reduzieren.
+    # - `pveam list local`     → Spalte 1: "local:vztmpl/debian-…amd64.tar.zst"
+    # - `pveam available ...`  → Spalte 2: "debian-…amd64.tar.zst  <größe>"
+    # Ein naives `grep -o 'debian[^ ]*'` auf available zieht die Größen-Spalte
+    # mit → arch_ok am " <zahl>" hängt → kein Treffer. Deshalb hier robust.
+    tmpl_names_local() {   # stdin: pveam list local → Namen (Spalte 1), debian-*
+        awk '{print $1}' | grep -o 'debian-[0-9][^ ]*' || true
+    }
+    tmpl_names_avail() {   # stdin: pveam available --section system → Namen (Spalte 2)
+        awk '{print $2}' | grep -o 'debian-[0-9][^ ]*' || true
+    }
+    arch_ok() {
+        local name="$1"
+        # Namen ohne Architektur-Suffix akzeptieren. Achtung: Template-Namen
+        # enden auf ".tar.zst" – das Suffix steht MITTEN im Namen
+        # ("debian-…_amd64.tar.zst"), also "_${want_suffix}*" (nicht nur
+        # am Ende) matchen.
+        if [[ "$name" == *_* ]]; then
+            [[ "$name" == *"_${want_suffix}"* ]] && return 0 || return 1
+        fi
+        return 0
+    }
+    pick_template() {   # $1 = Liste (bereits auf Namen reduziert)
+        local list="$1" name
+        while read -r name; do
+            [[ -z "$name" ]] && continue
+            if arch_ok "$name"; then echo "$name"; return 0; fi
+        done <<< "$list"
+        return 1
+    }
+
     local template=""
-    template=$(pveam list local 2>/dev/null | awk '{print $1}' | grep -o 'debian-13-standard[^ ]*' | sort -rV | head -1 || true)
+    # || true an JEDER pick_template-Zuweisung: bei "kein Treffer" liefert die
+    # Funktion Exit 1 – ohne Absicherung killt set -e die Zuweisung (Grube).
+    template=$(pick_template "$(pveam list local 2>/dev/null | tmpl_names_local | sort -rV)" || true)
     if [[ -z "$template" ]]; then
-        template=$(pveam list local 2>/dev/null | awk '{print $1}' | grep -o 'debian-12-standard[^ ]*' | sort -rV | head -1 || true)
+        template=$(pick_template "$(pveam list local 2>/dev/null | tmpl_names_local | grep 'debian-12' | sort -rV)" || true)
     fi
     if [[ -z "$template" ]]; then
-        info "Kein Debian-12/13-Template vorhanden – lade es herunter ..."
+        info "Kein passendes Debian-12/13-Template (${want_suffix}) im Cache – lade es herunter ..."
         pveam update
-        template=$(pveam available --section system 2>/dev/null | grep -o 'debian-13-standard[^ ]*' | sort -rV | head -1 || true)
+        template=$(pick_template "$(pveam available --section system 2>/dev/null | tmpl_names_avail | sort -rV)" || true)
         if [[ -z "$template" ]]; then
-            template=$(pveam available --section system 2>/dev/null | grep -o 'debian-12-standard[^ ]*' | sort -rV | head -1 || true)
+            template=$(pick_template "$(pveam available --section system 2>/dev/null | tmpl_names_avail | grep 'debian-12' | sort -rV)" || true)
         fi
         if [[ -z "$template" ]]; then
-            die "Weder debian-13- noch debian-12-standard-Template gefunden (pveam available leer?)."
+            die "Kein Debian-13/12-Template für Architektur '${want_suffix}' gefunden (pveam available leer?).\n  Vorhandene (evtl. fremdarchig): $(pveam list local 2>/dev/null | awk '{print $1}' | tr '\n' ' ')\n  Erzwingen (nur wenn die Arch wirklich passt!): pveam download local <template>"
         fi
         pveam download local "$template"
+    fi
+    # Gegenprobe: geladenes Template muss zur Host-Arch passen.
+    if [[ "$(arch_ok "$template" && echo ok || echo no)" != "ok" ]]; then
+        die "Template '${template}' passt NICHT zur Host-Architektur '${want_suffix}'.\n  Start würde mit 'Exec format error' scheitern. Passendes Template installieren:\n    pveam available --section system | grep '${want_suffix}'"
     fi
     ok "Template: $template"
 
