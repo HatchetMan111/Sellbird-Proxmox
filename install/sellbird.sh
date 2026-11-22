@@ -37,7 +37,7 @@
 set -Eeuo pipefail
 
 # ── Defaults ────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="1.0.1"   # 1.0.1: arm64-Template-auf-amd64-Fix (arch-gefilterte Template-Wahl)
+INSTALLER_VERSION="1.0.2"   # 1.0.2: libatomic1+Chromium-Libs vor playwright install-deps (Henne-Ei libatomic.so.1)
 APP_NAME="sellbird"
 UPSTREAM_URL="https://github.com/ethanplusai/sellbird.git"
 PINNED_REF="b212385259da92246a56311d790d936e75dd70dd"  # v0.4.0, 2026-11-18 – Upstream-HEAD beim Installer-Bau
@@ -494,9 +494,23 @@ runuser -u "${APP_USER}" -- "${VENV_DIR}/bin/python" -c "import sellbird.cli" \
 ok_echo "Sellbird ${UPSTREAM_VERSION} importiert"
 
 echo ">>> Playwright-Chromium (Website-Signals) ..."
-# System-Bibliotheken als root (install-deps nutzt apt), Browser-Binary als
-# APP_USER in sein Home-Cache (der Service läuft unter diesem Benutzer).
-"${VENV_DIR}/bin/python" -m playwright install-deps chromium >/dev/null
+# Henne-Ei: playwrights mitgeliefertes Node braucht libatomic.so.1, das im
+# nackten Debian-Template fehlt – `playwright install-deps` (das selbst Node
+# startet) scheitert dann mit Exit 127. Deshalb die Kern-Bibliotheken ERST
+# per apt installieren, dann install-deps (holt den Rest) + Browser-Binary.
+# System-Bibliotheken als root; Browser-Binary als APP_USER in sein Home-Cache
+# (der Service läuft unter diesem Benutzer).
+# Paketnamen: libasound2 heißt unter Debian 13 (trixie) libasound2t64 –
+# beide versuchen, ein unbekanntes Paket darf den Lauf nicht killen (|| true),
+# weil install-deps danach ohnehin die exakte Liste nachinstalliert.
+apt-get install -y -qq libatomic1 libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 \
+    libcups2 libdrm2 libdbus-1-3 libxcb1 libxkbcommon0 libx11-6 libxcomposite1 \
+    libxdamage1 libxext6 libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 \
+    libatspi2.0-0 libglib2.0-0 fonts-liberation >/dev/null 2>&1 || \
+    apt-get install -y -qq libatomic1 libnss3 libatk1.0-0 libgbm1 libasound2t64 >/dev/null 2>&1 || true
+if ! "${VENV_DIR}/bin/python" -m playwright install-deps chromium >/dev/null; then
+    warn_echo "playwright install-deps meldete Fehler – fahre fort (Kern-Libs sind installiert)."
+fi
 runuser -u "${APP_USER}" -- "${VENV_DIR}/bin/python" -m playwright install chromium
 
 echo ">>> Claude Code CLI (Reasoning-Engine, offizieller Native-Installer) ..."
